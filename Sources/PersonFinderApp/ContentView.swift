@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import Vision
 
 struct ContentView: View {
     @State private var referenceImage: NSImage?
@@ -55,7 +56,7 @@ struct ContentView: View {
                     Text("Matches found: \(searchResults.count)")
                         .font(.headline)
 
-                    List(searchResults, id: \ .self) { url in
+                    List(searchResults, id: \.self) { url in
                         Text(url.path)
                             .font(.system(size: 12, design: .monospaced))
                     }
@@ -114,6 +115,7 @@ struct ContentView: View {
         return true
     }
 
+    @MainActor
     private func chooseReferenceImage() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
@@ -131,6 +133,7 @@ struct ContentView: View {
         }
     }
 
+    @MainActor
     private func chooseSearchFolder() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
@@ -146,6 +149,7 @@ struct ContentView: View {
         }
     }
 
+    @MainActor
     private func runSearch() {
         guard let referenceURL = referenceImageURL,
               let searchFolderURL else {
@@ -176,18 +180,23 @@ struct ContentView: View {
     private func findMatches(referenceImageURL: URL, searchFolderURL: URL) async -> [URL] {
         let candidateFiles = collectImageFiles(in: searchFolderURL)
 
-        guard let reference = NSImage(contentsOf: referenceImageURL) else {
+        guard let referenceSignature = faceSignature(for: NSImage(contentsOf: referenceImageURL)) else {
             return []
         }
 
-        // Placeholder matching logic. Replace this with actual face-detection and face similarity code.
-        // For now, this intentionally returns files that have the same filename stem as the reference.
-        let referenceStem = referenceImageURL.deletingPathExtension().lastPathComponent.lowercased()
+        let scoredMatches = candidateFiles.compactMap { file -> (URL, Double)? in
+            guard let image = NSImage(contentsOf: file),
+                  let signature = faceSignature(for: image) else {
+                return nil
+            }
 
-        return candidateFiles.filter { file in
-            let name = file.deletingPathExtension().lastPathComponent.lowercased()
-            return name.contains(referenceStem) || referenceStem.contains(name)
+            let similarity = cosineSimilarity(referenceSignature, signature)
+            return similarity > 0.9 ? (file, similarity) : nil
         }
+
+        return scoredMatches
+            .sorted { $0.1 > $1.1 }
+            .map(\.0)
     }
 
     private func collectImageFiles(in folder: URL) -> [URL] {
@@ -205,13 +214,104 @@ struct ContentView: View {
 
         return enumerator.compactMap { item in
             guard let url = item as? URL,
-                  url.isImageFile,
-                  let ext = url.pathExtension.lowercased(),
-                  permittedExtensions.contains(ext) else {
+                  url.isImageFile else {
+                return nil
+            }
+
+            let ext = url.pathExtension.lowercased()
+            guard permittedExtensions.contains(ext) else {
                 return nil
             }
             return url
         }
+    }
+
+    private func faceSignature(for image: NSImage?) -> [Float]? {
+        guard let image,
+              let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return nil
+        }
+
+        let ciImage = CIImage(cgImage: cgImage)
+        let requests = VNDetectFaceRectanglesRequest()
+        let handler = VNImageRequestHandler(ciImage: ciImage, options: [:])
+
+        do {
+            try handler.perform([requests])
+        } catch {
+            return nil
+        }
+
+        guard let face = requests.results?.first as? VNFaceObservation else {
+            return nil
+        }
+
+        let normalizedRect = VNImageRectForNormalizedRect(face.boundingBox, cgImage.width, cgImage.height)
+        guard let cropped = cgImage.cropping(to: normalizedRect) else {
+            return nil
+        }
+
+        let targetWidth = 32
+        let targetHeight = 32
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+
+        guard let context = CGContext(
+            data: nil,
+            width: targetWidth,
+            height: targetHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: targetWidth * 4,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            return nil
+        }
+
+        let destinationRect = CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight)
+        context.draw(cropped, in: destinationRect)
+
+        guard let data = context.data else {
+            return nil
+        }
+
+        let ptr = data.bindMemory(to: UInt8.self, capacity: targetWidth * targetHeight * 4)
+        var signature: [Float] = []
+        signature.reserveCapacity(targetWidth * targetHeight * 3)
+
+        for y in 0..<targetHeight {
+            for x in 0..<targetWidth {
+                let index = (y * targetWidth + x) * 4
+                let r = Float(ptr[index]) / 255.0
+                let g = Float(ptr[index + 1]) / 255.0
+                let b = Float(ptr[index + 2]) / 255.0
+                signature.append(r)
+                signature.append(g)
+                signature.append(b)
+            }
+        }
+
+        return signature
+    }
+
+    private func cosineSimilarity(_ lhs: [Float], _ rhs: [Float]) -> Double {
+        let count = min(lhs.count, rhs.count)
+        guard count > 0 else { return 0 }
+
+        var dot: Double = 0
+        var lhsMagnitude: Double = 0
+        var rhsMagnitude: Double = 0
+
+        for index in 0..<count {
+            let left = Double(lhs[index])
+            let right = Double(rhs[index])
+            dot += left * right
+            lhsMagnitude += left * left
+            rhsMagnitude += right * right
+        }
+
+        guard lhsMagnitude > 0, rhsMagnitude > 0 else { return 0 }
+        return dot / (sqrt(lhsMagnitude) * sqrt(rhsMagnitude))
     }
 }
 
@@ -221,3 +321,7 @@ extension URL {
         return ["jpg", "jpeg", "png", "heic", "tif", "tiff", "bmp", "gif", "webp"].contains(ext)
     }
 }
+
+// Xcode build note:
+// This project should be built in Xcode (not raw swift build) because the SwiftUI macro
+// runtime and AppKit/SwiftUI toolchain integration are provided by the Xcode SDK and plugin system.
